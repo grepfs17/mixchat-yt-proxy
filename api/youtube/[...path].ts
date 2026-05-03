@@ -1,5 +1,5 @@
+import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { getInnertube, invalidateInnertube } from '../../lib/innertube';
-import { validateAuthToken } from '../../lib/auth';
 
 const DEBUG = process.env.YT_DEBUG === '1';
 
@@ -7,17 +7,15 @@ export const config = {
   maxDuration: 300,
 };
 
-export default async function handler(req: Request): Promise<Response> {
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // CORS preflight
   if (req.method === 'OPTIONS') {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-        'Access-Control-Max-Age': '86400',
-      },
-    });
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.setHeader('Access-Control-Max-Age', '86400');
+    res.status(204).end();
+    return;
   }
 
   const corsHeaders: Record<string, string> = {
@@ -25,66 +23,68 @@ export default async function handler(req: Request): Promise<Response> {
     'Access-Control-Allow-Headers': 'Authorization, Content-Type',
   };
 
-  const authError = validateAuthToken(req);
-  if (authError) return authError;
+  // Validate auth token from Authorization header
+  const authToken = process.env.AUTH_TOKEN;
+  if (!authToken) {
+    console.error('[Auth] AUTH_TOKEN env var is not set — proxy is open!');
+  } else {
+    const auth = req.headers['authorization'];
+    if (!auth) {
+      res.status(401).json({ error: 'Missing Authorization header' });
+      return;
+    }
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
+    if (token.length !== authToken.length || token !== authToken) {
+      res.status(401).json({ error: 'Invalid token' });
+      return;
+    }
+  }
 
-  const url = new URL(req.url);
-  // The catch-all [...path] captures everything after /api/youtube/
-  // e.g. /api/youtube/youtubei/v1/live_chat/get_live_chat → youtubei/v1/live_chat/get_live_chat
-  const pathSegments = url.pathname.replace(/^\/api\/youtube\/?/, '');
+  // The catch-all route captures everything after /api/youtube/
+  // e.g. /api/youtube/youtubei/v1/live_chat/get_live_chat
+  const pathSegments = (req.url || '').replace(/^\/api\/youtube\/?/, '').replace(/\?.*$/, '');
   const innerTubePath = '/' + pathSegments;
 
-  if (!innerTubePath || innerTubePath === '/') {
-    return new Response(JSON.stringify({ error: 'Missing InnerTube path' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json', ...corsHeaders },
-    });
+  if (!pathSegments) {
+    res.status(400).json({ error: 'Missing InnerTube path' });
+    return;
   }
 
   try {
     let yt;
     try {
       yt = await getInnertube();
-    } catch (initErr) {
-      const msg = initErr instanceof Error ? initErr.message : String(initErr);
+    } catch (initErr: any) {
+      const msg = initErr?.message || String(initErr);
       console.error('[Proxy] Failed to initialize Innertube:', msg);
 
-      // If it was a 403 cooldown, return 503 so the client knows to retry
       if (msg.includes('Cooldown after 403')) {
-        return new Response(JSON.stringify({ error: 'YouTube temporarily blocked — retry later', retryAfter: 30 }), {
-          status: 503,
-          headers: { 'Content-Type': 'application/json', 'Retry-After': '30', ...corsHeaders },
-        });
+        res.setHeader('Retry-After', '30');
+        res.status(503).json({ error: 'YouTube temporarily blocked — retry later', retryAfter: 30 });
+        return;
       }
 
-      return new Response(JSON.stringify({ error: 'YouTube service unavailable', details: DEBUG ? msg : undefined }), {
-        status: 503,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders },
-      });
+      res.status(503).json({ error: 'YouTube service unavailable', details: DEBUG ? msg : undefined });
+      return;
     }
 
-    // Read the request body (POST) or query params (GET)
+    // Parse request body
     let body: any = undefined;
-    if (req.method === 'POST') {
-      const contentType = req.headers.get('content-type') || '';
-      if (contentType.includes('application/json') || contentType.includes('text/plain') || contentType.includes('application/x-protobuf') || contentType.includes('application/x-www-form-urlencoded')) {
-        const rawBody = await req.text();
-        if (rawBody) {
-          try {
-            body = JSON.parse(rawBody);
-          } catch {
-            // Not JSON — pass through as-is for protobuf etc.
-            // For protobuf, we need to forward raw bytes via actions.execute
-            // which only supports JSON payloads. Fall back to raw fetch.
-            return forwardRaw(yt, innerTubePath, req, rawBody, corsHeaders);
-          }
+    if (req.method === 'POST' && req.body) {
+      if (typeof req.body === 'object') {
+        body = req.body;
+      } else if (typeof req.body === 'string') {
+        try {
+          body = JSON.parse(req.body);
+        } catch {
+          // Non-JSON body — fall back to raw forwarding
+          return await forwardRaw(yt, innerTubePath, req, res, req.body, corsHeaders);
         }
       }
     }
 
-    // Build the InnerTube API endpoint from the path.
-    // Strip leading slash and the "youtubei/v1/" prefix if present, since
-    // actions.execute expects just the API name (e.g. "live_chat/get_live_chat").
+    // Strip "youtubei/v1/" prefix since actions.execute expects just
+    // the API name (e.g. "live_chat/get_live_chat" or "player").
     let apiName = innerTubePath.replace(/^\//, '');
     if (apiName.startsWith('youtubei/v1/')) {
       apiName = apiName.slice('youtubei/v1/'.length);
@@ -94,10 +94,14 @@ export default async function handler(req: Request): Promise<Response> {
       console.debug(`[Proxy] ${req.method} → InnerTube API: ${apiName}`, { hasBody: !!body });
     }
 
-    // Merge query params from the original request
+    // Merge query params from the original request URL
     const params: Record<string, any> = {};
-    for (const [key, value] of url.searchParams.entries()) {
-      params[key] = value;
+    const queryString = (req.url || '').split('?')[1];
+    if (queryString) {
+      for (const pair of queryString.split('&')) {
+        const [key, value] = pair.split('=');
+        if (key) params[decodeURIComponent(key)] = decodeURIComponent(value || '');
+      }
     }
 
     // Use actions.execute for JSON payloads
@@ -108,8 +112,8 @@ export default async function handler(req: Request): Promise<Response> {
         ...params,
         parse: false,
       });
-    } catch (execErr) {
-      const msg = execErr instanceof Error ? execErr.message : String(execErr);
+    } catch (execErr: any) {
+      const msg = execErr?.message || String(execErr);
 
       if (/status code 403/i.test(msg)) {
         invalidateInnertube();
@@ -123,38 +127,30 @@ export default async function handler(req: Request): Promise<Response> {
             ...params,
             parse: false,
           });
-        } catch (retryErr) {
-          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-          return new Response(JSON.stringify({ error: 'YouTube blocked request after retry', details: DEBUG ? retryMsg : undefined }), {
-            status: 503,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders },
-          });
+        } catch (retryErr: any) {
+          const retryMsg = retryErr?.message || String(retryErr);
+          res.status(503).json({ error: 'YouTube blocked request after retry', details: DEBUG ? retryMsg : undefined });
+          return;
         }
       } else {
         throw execErr;
       }
     }
 
-    // response from actions.execute({ parse: false }) is the raw JSON
+    // response from actions.execute({ parse: false }) is raw JSON
     const responseData = typeof response === 'string' ? response : JSON.stringify(response);
 
-    return new Response(responseData, {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-cache',
-        ...corsHeaders,
-      },
-    });
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    const stack = error instanceof Error ? error.stack : undefined;
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.status(200).send(responseData);
+  } catch (error: any) {
+    const msg = error?.message || String(error);
+    const stack = error?.stack;
     console.error('[Proxy] Unhandled error:', { message: msg, stack });
 
-    return new Response(JSON.stringify({ error: 'Internal proxy error', details: DEBUG ? msg : undefined }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json', ...corsHeaders },
-    });
+    res.status(500).json({ error: 'Internal proxy error', details: DEBUG ? msg : undefined });
   }
 }
 
@@ -165,15 +161,16 @@ export default async function handler(req: Request): Promise<Response> {
 async function forwardRaw(
   yt: any,
   innerTubePath: string,
-  req: Request,
+  req: VercelRequest,
+  res: VercelResponse,
   rawBody: string,
   corsHeaders: Record<string, string>,
-): Promise<Response> {
+): Promise<void> {
   const baseURL = 'https://www.youtube.com';
   const targetURL = `${baseURL}${innerTubePath}`;
 
   const headers: Record<string, string> = {
-    'Content-Type': req.headers.get('content-type') || 'application/x-protobuf',
+    'Content-Type': req.headers['content-type'] || 'application/x-protobuf',
     'User-Agent': process.env.YT_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Referer': 'https://www.youtube.com/',
     'Accept-Language': 'en-US,en;q=0.9',
@@ -202,12 +199,10 @@ async function forwardRaw(
 
   const respBody = await ytRes.text();
 
-  return new Response(respBody, {
-    status: ytRes.status,
-    headers: {
-      'Content-Type': ytRes.headers.get('content-type') || 'application/json',
-      'Cache-Control': 'no-cache',
-      ...corsHeaders,
-    },
-  });
+  res.setHeader('Content-Type', ytRes.headers.get('content-type') || 'application/json');
+  res.setHeader('Cache-Control', 'no-cache');
+  for (const [k, v] of Object.entries(corsHeaders)) {
+    res.setHeader(k, v);
+  }
+  res.status(ytRes.status).send(respBody);
 }
