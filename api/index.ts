@@ -3,95 +3,7 @@ import { Innertube, Parser } from 'youtubei.js';
 
 const DEBUG = process.env.YT_DEBUG === '1';
 
-// ── PoToken ──────────────────────────────────────────────────────────
-interface PoTokenData {
-  visitorData: string;
-  poToken: string;
-  generatedAt: number;
-  ttlMs: number;
-}
-
-const BG_REQUEST_KEY = 'O43z0dpjhgX20SCx4KAo';
-let cachedPoToken: PoTokenData | null = null;
-let poTokenPromise: Promise<PoTokenData> | null = null;
-const PO_TOKEN_DEFAULT_TTL = 30 * 60 * 1000;
-
-async function generatePoToken(): Promise<PoTokenData> {
-  const { BG } = await import('bgutils-js');
-
-  const userAgent = process.env.YT_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-
-  const tempYT = await Innertube.create({
-    retrieve_player: false,
-    user_agent: userAgent,
-    generate_session_locally: true,
-  });
-
-  const visitorData = tempYT.session.context.client.visitorData;
-  if (!visitorData) throw new Error('[PoToken] No visitorData from session');
-
-  let dom: any;
-  try {
-    const { JSDOM } = await import('jsdom');
-    dom = new JSDOM('<!DOCTYPE html><html><head></head><body></body></html>', {
-      url: 'https://www.youtube.com/',
-      referrer: 'https://www.youtube.com/',
-    });
-    const win = dom.window as any;
-    Object.assign(globalThis, { window: win, document: win.document, location: win.location, origin: win.origin });
-    if (!Reflect.has(globalThis, 'navigator')) {
-      Object.defineProperty(globalThis, 'navigator', { value: win.navigator });
-    }
-  } catch (domErr: any) {
-    throw new Error(`[PoToken] JSDOM failed: ${domErr?.message || String(domErr)}`);
-  }
-
-  const bgConfig = {
-    fetch: (input: string | URL | Request, init?: RequestInit) => fetch(input, init),
-    globalObj: globalThis,
-    identifier: visitorData,
-    requestKey: BG_REQUEST_KEY,
-  };
-
-  const bgChallenge = await BG.Challenge.create(bgConfig as any);
-  if (!bgChallenge) throw new Error('[PoToken] No BotGuard challenge');
-
-  const interpreterJavascript = bgChallenge.interpreterJavascript?.privateDoNotAccessOrElseSafeScriptWrappedValue;
-  if (interpreterJavascript) {
-    new Function(interpreterJavascript)();
-  } else {
-    throw new Error('[PoToken] No BotGuard interpreter script');
-  }
-
-  const result = await BG.PoToken.generate({
-    program: bgChallenge.program,
-    globalName: bgChallenge.globalName,
-    bgConfig: bgConfig as any,
-  });
-
-  const poToken = result.poToken;
-  if (!poToken) throw new Error('[PoToken] Empty poToken result');
-
-  const ttlMs = result.integrityTokenData?.estimatedTtlSecs != null
-    ? Math.max(result.integrityTokenData.estimatedTtlSecs * 1000 * 0.8, 60_000)
-    : PO_TOKEN_DEFAULT_TTL;
-
-  if (DEBUG) console.debug('[PoToken] Generated OK');
-  return { visitorData, poToken, generatedAt: Date.now(), ttlMs };
-}
-
-function getPoToken(): Promise<PoTokenData> {
-  if (cachedPoToken && Date.now() < cachedPoToken.generatedAt + cachedPoToken.ttlMs) {
-    return Promise.resolve(cachedPoToken);
-  }
-  if (poTokenPromise) return poTokenPromise;
-  poTokenPromise = generatePoToken().then(data => { cachedPoToken = data; poTokenPromise = null; return data; }).catch(err => { poTokenPromise = null; throw err; });
-  return poTokenPromise;
-}
-
-function invalidatePoToken() { cachedPoToken = null; poTokenPromise = null; }
-
-// ── Innertube singleton ───────────────────────────────────────────────
+// ── Innertube session for session context (api key, visitor data, etc.) ──
 let ytSingleton: Innertube | null = null;
 let isInitializing = false;
 let last403Time = 0;
@@ -101,14 +13,10 @@ Parser.setParserErrorHandler(({ error_type }) => {
   if (error_type === 'class_not_found') return;
 });
 
-function invalidateInnertube() {
-  ytSingleton = null;
-  invalidatePoToken();
-}
+function invalidateInnertube() { ytSingleton = null; }
 
 async function getInnertube(): Promise<Innertube> {
   if (ytSingleton) return ytSingleton;
-
   const timeSince403 = Date.now() - last403Time;
   if (timeSince403 < COOLDOWN_AFTER_403_MS) {
     throw new Error(`[YouTube] Cooldown after 403 — retry in ${Math.ceil((COOLDOWN_AFTER_403_MS - timeSince403) / 1000)}s`);
@@ -130,92 +38,43 @@ async function getInnertube(): Promise<Innertube> {
     }
 
     opts.generate_session_locally = process.env.YT_GENERATE_SESSION_LOCALLY !== 'false';
-
     if (process.env.YT_COOKIE) opts.cookie = process.env.YT_COOKIE;
 
     const envPoToken = process.env.YT_POTOKEN;
     const envVisitorData = process.env.YT_VISITOR_DATA;
-
     if (envPoToken) opts.po_token = envPoToken;
     if (envVisitorData) opts.visitor_data = envVisitorData;
 
-    const autoPotoken = !envPoToken && !envVisitorData && clientType === 'WEB' && process.env.YT_POTOKEN !== 'off' && process.env.YT_AUTO_POTOKEN !== '0';
-
+    // Auto PoToken disabled by default on Vercel (JSDOM not available)
+    // Set YT_AUTO_POTOKEN=1 only on VPS/Docker with JSDOM support
+    const autoPotoken = !envPoToken && !envVisitorData && clientType === 'WEB' && process.env.YT_POTOKEN !== 'off' && process.env.YT_AUTO_POTOKEN === '1';
     if (autoPotoken) {
       try {
-        const tokenData = await getPoToken();
-        opts.po_token = tokenData.poToken;
-        opts.visitor_data = tokenData.visitorData;
+        const { BG } = await import('bgutils-js');
+        const { JSDOM } = await import('jsdom');
+        const tempYT = await Innertube.create({ retrieve_player: false, user_agent: opts.user_agent, generate_session_locally: true });
+        const visitorData = tempYT.session.context.client.visitorData;
+        if (!visitorData) throw new Error('No visitorData');
+        const dom = new JSDOM('<!DOCTYPE html><html><head></head><body></body></html>', { url: 'https://www.youtube.com/', referrer: 'https://www.youtube.com/' });
+        const win = dom.window as any;
+        Object.assign(globalThis, { window: win, document: win.document, location: win.location, origin: win.origin });
+        if (!Reflect.has(globalThis, 'navigator')) Object.defineProperty(globalThis, 'navigator', { value: win.navigator });
+        const bgConfig = { fetch: (input: any, init?: any) => fetch(input, init), globalObj: globalThis, identifier: visitorData, requestKey: 'O43z0dpjhgX20SCx4KAo' };
+        const bgChallenge = await BG.Challenge.create(bgConfig as any);
+        if (!bgChallenge) throw new Error('No BotGuard challenge');
+        const interpJs = bgChallenge.interpreterJavascript?.privateDoNotAccessOrElseSafeScriptWrappedValue;
+        if (interpJs) new Function(interpJs)(); else throw new Error('No interpreter script');
+        const poResult = await BG.PoToken.generate({ program: bgChallenge.program, globalName: bgChallenge.globalName, bgConfig: bgConfig as any });
+        if (!poResult.poToken) throw new Error('Empty poToken');
+        opts.po_token = poResult.poToken;
+        opts.visitor_data = visitorData;
+        if (DEBUG) console.debug('[YouTube] PoToken generated');
       } catch (poErr: any) {
-        const msg = poErr instanceof Error ? poErr.message : String(poErr);
-        console.warn('[YouTube] Auto PoToken failed, continuing without:', msg);
+        console.warn('[YouTube] PoToken failed:', poErr?.message || String(poErr));
       }
     }
 
-    if (DEBUG) {
-      console.debug(`[YouTube] Initializing Innertube (${clientType})`, {
-        hasPoToken: !!opts.po_token,
-        hasCookie: !!opts.cookie,
-        hasVisitorData: !!opts.visitor_data,
-        autoPotoken,
-      });
-    }
-
-    const baseUserAgent = opts.user_agent;
-    const baseReferer = (process.env.ORIGIN || 'https://www.youtube.com/').replace(/\/?$/, '/');
-
-    opts.fetch = async (input: any, init?: any) => {
-      let urlStr = '';
-      try {
-        if (typeof input === 'string') urlStr = input;
-        else if (input && typeof input === 'object' && 'url' in input) urlStr = String(input.url);
-        else urlStr = String(input);
-      } catch { urlStr = String(input); }
-
-      const headers: Record<string, string> = {};
-      const orig = init?.headers;
-      if (orig) {
-        if (typeof (orig as any).entries === 'function') {
-          for (const [k, v] of (orig as any).entries()) { try { headers[k.toLowerCase()] = String(v); } catch {} }
-        } else if (typeof (orig as any).forEach === 'function') {
-          try { (orig as any).forEach((v: any, k: string) => { try { headers[k.toLowerCase()] = String(v); } catch {} }); } catch {}
-        } else if (typeof orig === 'object') {
-          for (const k of Object.keys(orig)) { try { headers[k.toLowerCase()] = String((orig as any)[k]); } catch {} }
-        }
-      }
-
-      if ('x-goog-visitor-id' in headers) {
-        if (!headers['x-goog-visitor-id']?.trim()) delete headers['x-goog-visitor-id'];
-      }
-
-      if (!headers['user-agent'] && baseUserAgent) headers['user-agent'] = baseUserAgent;
-      if (!headers['referer']) headers['referer'] = baseReferer;
-      if (!headers['accept-language']) headers['accept-language'] = 'en-US,en;q=0.9';
-
-      if (DEBUG) console.debug('[YouTube] innertube fetch:', urlStr.slice(0, 120));
-
-      const merged = { ...(init || {}), headers };
-      try {
-        const res = await fetch(input, merged);
-        if (res.status >= 400) {
-          try {
-            const clone = res.clone();
-            const txt = await clone.text().catch(() => '');
-            if (res.status === 403) {
-              last403Time = Date.now();
-              console.error('[YouTube] 403 — invalidating session.', { url: urlStr, body: txt.slice(0, 500) });
-              invalidateInnertube();
-            } else {
-              console.error('[YouTube] non-OK', { url: urlStr, status: res.status, body: txt.slice(0, 500) });
-            }
-          } catch {}
-        }
-        return res;
-      } catch (err) {
-        if (DEBUG) console.error('[YouTube] fetch failed', err);
-        throw err;
-      }
-    };
+    if (DEBUG) console.debug(`[YouTube] Initializing Innertube (${clientType})`, { hasPoToken: !!opts.po_token, hasCookie: !!opts.cookie, hasVisitorData: !!opts.visitor_data });
 
     ytSingleton = await Innertube.create(opts);
     return ytSingleton;
@@ -228,14 +87,14 @@ async function getInnertube(): Promise<Innertube> {
   }
 }
 
-// ── API Handler ───────────────────────────────────────────────────────
+// ── API Handler (transparent proxy) ──────────────────────────────────
 export const config = { maxDuration: 300 };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Health check
   if (!req.url || req.url === '/api/youtube' || req.url === '/api/youtube/' || req.url?.split('?')[0] === '/api/youtube' || req.url?.split('?')[0] === '/api/youtube/') {
     res.setHeader('Content-Type', 'application/json');
-    res.status(200).json({ status: 'ok', service: 'mixchat-yt-proxy', timestamp: Date.now() });
+    res.status(200).json({ status: 'ok', service: 'mixchat-yt-proxy' });
     return;
   }
 
@@ -249,23 +108,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  const corsHeaders: Record<string, string> = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-  };
-
   // Auth
   const authToken = process.env.AUTH_TOKEN;
-  if (!authToken) {
-    console.error('[Auth] AUTH_TOKEN env var is not set — proxy is open!');
-  } else {
+  if (authToken) {
     const auth = req.headers['authorization'];
     if (!auth) { res.status(401).json({ error: 'Missing Authorization header' }); return; }
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
-    if (token.length !== authToken.length || token !== authToken) { res.status(401).json({ error: 'Invalid token' }); return; }
+    if (token !== authToken) { res.status(401).json({ error: 'Invalid token' }); return; }
+  } else {
+    console.warn('[Auth] AUTH_TOKEN not set — proxy is open!');
   }
 
-  // Parse path
+  // Parse YouTube InnerTube path
   const originalUrl: string = req.url || '';
   const pathMatch = originalUrl.match(/^\/api\/youtube\/?(.*)/);
   if (!pathMatch || !pathMatch[1]) {
@@ -273,119 +127,107 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  const pathAndQuery = pathMatch[1];
-  const qIdx = pathAndQuery.indexOf('?');
-  const pathSegments = qIdx >= 0 ? pathAndQuery.slice(0, qIdx) : pathAndQuery;
-  const queryString = qIdx >= 0 ? pathAndQuery.slice(qIdx + 1) : '';
+  const innerTubePath = '/' + pathMatch[1].replace(/\?.*$/, '');
+  const queryString = pathMatch[1].includes('?') ? pathMatch[1].split('?').slice(1).join('?') : '';
 
-  // Reject full URLs or garbage paths — only InnerTube API paths are valid
-  if (pathSegments.startsWith('http') || pathSegments.includes('://') || pathSegments.includes('@')) {
-    res.status(400).json({ error: 'Invalid InnerTube path. Expected youtubei/v1/<endpoint>', received: pathSegments });
+  // Reject garbage paths
+  if (innerTubePath.includes('://') || innerTubePath.includes('@')) {
+    res.status(400).json({ error: 'Invalid InnerTube path', path: innerTubePath });
     return;
   }
 
+  // Get Innertube session for context headers
+  let yt;
   try {
-    let yt;
-    try {
-      yt = await getInnertube();
-    } catch (initErr: any) {
-      const msg = initErr?.message || String(initErr);
-      console.error('[Proxy] Failed to initialize Innertube:', msg);
-      if (msg.includes('Cooldown after 403')) {
-        res.setHeader('Retry-After', '30');
-        res.status(503).json({ error: 'YouTube temporarily blocked — retry later', retryAfter: 30 });
-        return;
-      }
-      res.status(503).json({ error: 'YouTube service unavailable', details: DEBUG ? msg : undefined });
+    yt = await getInnertube();
+  } catch (initErr: any) {
+    const msg = initErr?.message || String(initErr);
+    console.error('[Proxy] Innertube init failed:', msg);
+    if (msg.includes('Cooldown after 403')) {
+      res.setHeader('Retry-After', '30');
+      res.status(503).json({ error: 'YouTube temporarily blocked', retryAfter: 30 });
       return;
     }
-
-    let body: any = undefined;
-    if (req.method === 'POST' && req.body) {
-      if (typeof req.body === 'object') {
-        body = req.body;
-      } else if (typeof req.body === 'string') {
-        try { body = JSON.parse(req.body); } catch { return await forwardRaw(yt, '/' + pathSegments, req, res, req.body, corsHeaders); }
-      }
-    }
-
-    // Strip client context from body — actions.execute adds the proxy's
-    // own session context (with PoToken, visitor data, etc.). Without
-    // this, the forwarded client context overwrites the proxy's context
-    // and YouTube returns 400 "invalid argument".
-    if (body && typeof body === 'object') {
-      delete body.context;
-    }
-
-    let apiName = pathSegments.replace(/^youtubei\/v1\//, '');
-    if (DEBUG) console.debug(`[Proxy] ${req.method} → ${apiName}`, { hasBody: !!body });
-
-    const params: Record<string, any> = {};
-    if (queryString) {
-      for (const pair of queryString.split('&')) {
-        const eqIdx = pair.indexOf('=');
-        if (eqIdx >= 0) params[decodeURIComponent(pair.slice(0, eqIdx))] = decodeURIComponent(pair.slice(eqIdx + 1));
-        else if (pair) params[decodeURIComponent(pair)] = '';
-      }
-    }
-
-    let response;
-    try {
-      response = await yt.actions.execute(apiName, { ...(body ? { ...body } : {}), ...params, parse: false });
-    } catch (execErr: any) {
-      const msg = execErr?.message || String(execErr);
-      if (/status code 403/i.test(msg)) {
-        invalidateInnertube();
-        console.error('[Proxy] 403 — retrying with fresh session');
-        try {
-          yt = await getInnertube();
-          response = await yt.actions.execute(apiName, { ...(body ? { ...body } : {}), ...params, parse: false });
-        } catch (retryErr: any) {
-          const retryMsg = retryErr?.message || String(retryErr);
-          res.status(503).json({ error: 'YouTube blocked request after retry', details: DEBUG ? retryMsg : undefined });
-          return;
-        }
-      } else {
-        throw execErr;
-      }
-    }
-
-    const responseData = typeof response === 'string' ? response : JSON.stringify(response);
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-    res.status(200).send(responseData);
-  } catch (error: any) {
-    const msg = error?.message || String(error);
-    const stack = error?.stack;
-    console.error('[Proxy] Unhandled error:', { message: msg, stack });
-    res.status(500).json({ error: 'Internal proxy error', details: DEBUG ? msg : undefined });
+    res.status(503).json({ error: 'YouTube service unavailable', details: DEBUG ? msg : undefined });
+    return;
   }
-}
 
-async function forwardRaw(yt: any, innerTubePath: string, req: VercelRequest, res: VercelResponse, rawBody: string, corsHeaders: Record<string, string>): Promise<void> {
+  // Build forwarding headers from the Innertube session
+  const session = yt.session;
+  const client = session?.context?.client;
+  const apiKey = session?.api_key || (session as any)?.apiKey;
+  const visitorData = client?.visitorData;
+
   const targetURL = `https://www.youtube.com${innerTubePath}`;
-  const headers: Record<string, string> = {
-    'Content-Type': req.headers['content-type'] as string || 'application/x-protobuf',
+
+  const forwardHeaders: Record<string, string> = {
+    'Content-Type': req.headers['content-type'] as string || 'application/json',
     'User-Agent': process.env.YT_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Referer': 'https://www.youtube.com/',
     'Accept-Language': 'en-US,en;q=0.9',
+    'Origin': 'https://www.youtube.com',
   };
 
-  const session = yt.session;
-  if (session?.context?.client) {
-    const client = session.context.client;
-    headers['x-youtube-client-name'] = String(client.clientName ?? '1');
-    headers['x-youtube-client-version'] = client.clientVersion ?? '2.20240510.00.00';
-    if (client.visitorData) headers['x-goog-visitor-id'] = client.visitorData;
-  }
-  if (yt.session?.api_key) headers['x-youtube-api-key'] = yt.session.api_key;
+  if (apiKey) forwardHeaders['x-youtube-api-key'] = apiKey;
+  if (client?.clientName) forwardHeaders['x-youtube-client-name'] = String(client.clientName);
+  if (client?.clientVersion) forwardHeaders['x-youtube-client-version'] = client.clientVersion;
+  if (visitorData) forwardHeaders['x-goog-visitor-id'] = visitorData;
+  if (process.env.YT_COOKIE) forwardHeaders['Cookie'] = process.env.YT_COOKIE;
 
-  const ytRes = await fetch(targetURL, { method: 'POST', headers, body: rawBody });
-  const respBody = await ytRes.text();
-  res.setHeader('Content-Type', ytRes.headers.get('content-type') || 'application/json');
-  res.setHeader('Cache-Control', 'no-cache');
-  for (const [k, v] of Object.entries(corsHeaders)) res.setHeader(k, v);
-  res.status(ytRes.status).send(respBody);
+  // Inject session context into request body for POST requests
+  let requestBody: string | undefined;
+  if (req.method === 'POST' && req.body) {
+    let bodyObj: any;
+    if (typeof req.body === 'object') {
+      bodyObj = { ...req.body };
+    } else if (typeof req.body === 'string') {
+      try { bodyObj = JSON.parse(req.body); } catch {
+        // Non-JSON body — forward as-is
+        requestBody = req.body;
+      }
+    }
+
+    if (bodyObj) {
+      // Replace client context with the proxy's session context
+      if (session?.context) {
+        bodyObj.context = session.context;
+      }
+      requestBody = JSON.stringify(bodyObj);
+    }
+  }
+
+  // Append query string
+  const finalURL = queryString ? `${targetURL}?${queryString}` : targetURL;
+
+  if (DEBUG) {
+    console.debug(`[Proxy] ${req.method} → ${targetURL}`, { hasBody: !!requestBody, apiKey: !!apiKey, visitorData: !!visitorData, clientName: client?.clientName });
+  }
+
+  try {
+    const ytRes = await fetch(finalURL, {
+      method: req.method || (requestBody ? 'POST' : 'GET'),
+      headers: forwardHeaders,
+      body: requestBody,
+    });
+
+    if (DEBUG) console.debug(`[Proxy] ← ${ytRes.status} ${ytRes.statusText}`);
+
+    // On 403, invalidate the Innertube session for retry
+    if (ytRes.status === 403) {
+      invalidateInnertube();
+      console.error('[Proxy] YouTube returned 403 — invalidated session');
+    }
+
+    const respBody = await ytRes.text();
+
+    res.setHeader('Content-Type', ytRes.headers.get('content-type') || 'application/json');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.status(ytRes.status).send(respBody);
+  } catch (error: any) {
+    const msg = error?.message || String(error);
+    console.error('[Proxy] Request failed:', msg);
+    res.status(502).json({ error: 'Proxy request failed', details: DEBUG ? msg : undefined });
+  }
 }
