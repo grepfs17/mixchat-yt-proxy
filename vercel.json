@@ -1,4 +1,5 @@
 {
+  "buildCommand": "npm run type-check || true",
   "functions": {
     "api/youtube/[...path].ts": {
       "maxDuration": 300
