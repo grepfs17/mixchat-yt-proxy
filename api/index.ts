@@ -309,6 +309,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
+    // Strip client context from body — actions.execute adds the proxy's
+    // own session context (with PoToken, visitor data, etc.). Without
+    // this, the forwarded client context overwrites the proxy's context
+    // and YouTube returns 400 "invalid argument".
+    if (body && typeof body === 'object') {
+      delete body.context;
+    }
+
     let apiName = pathSegments.replace(/^youtubei\/v1\//, '');
     if (DEBUG) console.debug(`[Proxy] ${req.method} → ${apiName}`, { hasBody: !!body });
 
