@@ -190,11 +190,13 @@ async function forwardRaw(
     }
   }
 
-  const sessionHeaders = yt.session?.api_key ? { 'x-youtube-api-key': yt.session.api_key } : {};
+  if (yt.session?.api_key) {
+    headers['x-youtube-api-key'] = yt.session.api_key;
+  }
 
   const ytRes = await fetch(targetURL, {
     method: 'POST',
-    headers: { ...headers, ...sessionHeaders },
+    headers,
     body: rawBody,
   });
 
