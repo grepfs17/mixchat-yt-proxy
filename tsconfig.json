@@ -7,12 +7,11 @@
     "strict": true,
     "skipLibCheck": true,
     "outDir": "dist",
-    "rootDir": ".",
     "declaration": false,
     "resolveJsonModule": true,
     "isolatedModules": true,
     "types": ["node"]
   },
-  "include": ["api/**/*.ts", "lib/**/*.ts", "types/**/*.ts"],
+  "include": ["api/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }
