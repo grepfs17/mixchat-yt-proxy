@@ -1,9 +1,45 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { Innertube, Parser } from 'youtubei.js';
+import { timingSafeEqual } from 'crypto';
 
 const DEBUG = process.env.YT_DEBUG === '1';
+const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || '';
 
-// ── Innertube session for session context (api key, visitor data, etc.) ──
+// ── Rate limiting (in-memory, per-IP) ──────────────────────────────
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_REQUESTS = 120;
+const ipRequests = new Map<string, { count: number; resetAt: number }>();
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const entry = ipRequests.get(ip);
+  if (!entry || now > entry.resetAt) {
+    ipRequests.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return false;
+  }
+  entry.count++;
+  return entry.count > RATE_LIMIT_MAX_REQUESTS;
+}
+
+// Clean up expired entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of ipRequests) {
+    if (now > entry.resetAt) ipRequests.delete(ip);
+  }
+}, 300_000);
+
+// ── Constant-time auth ──────────────────────────────────────────────
+function verifyToken(provided: string, expected: string): boolean {
+  if (provided.length !== expected.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+}
+
+// ── Innertube session ───────────────────────────────────────────────
 let ytSingleton: Innertube | null = null;
 let isInitializing = false;
 let last403Time = 0;
@@ -45,8 +81,6 @@ async function getInnertube(): Promise<Innertube> {
     if (envPoToken) opts.po_token = envPoToken;
     if (envVisitorData) opts.visitor_data = envVisitorData;
 
-    // Auto PoToken disabled by default on Vercel (JSDOM not available)
-    // Set YT_AUTO_POTOKEN=1 only on VPS/Docker with JSDOM support
     const autoPotoken = !envPoToken && !envVisitorData && clientType === 'WEB' && process.env.YT_POTOKEN !== 'off' && process.env.YT_AUTO_POTOKEN === '1';
     if (autoPotoken) {
       try {
@@ -87,20 +121,16 @@ async function getInnertube(): Promise<Innertube> {
   }
 }
 
-// ── API Handler (transparent proxy) ──────────────────────────────────
+// ── API Handler ─────────────────────────────────────────────────────
 export const config = { maxDuration: 300 };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Health check
-  if (!req.url || req.url === '/api/youtube' || req.url === '/api/youtube/' || req.url?.split('?')[0] === '/api/youtube' || req.url?.split('?')[0] === '/api/youtube/') {
-    res.setHeader('Content-Type', 'application/json');
-    res.status(200).json({ status: 'ok', service: 'mixchat-yt-proxy' });
-    return;
-  }
+  const origin = req.headers.origin || req.headers.referer?.split('/').slice(0, 3).join('/') || '';
+  const isAllowedOrigin = !origin || origin === ALLOWED_ORIGIN || origin === process.env.ORIGIN;
 
   // CORS preflight
   if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Origin', isAllowedOrigin ? ALLOWED_ORIGIN : '');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
     res.setHeader('Access-Control-Max-Age', '86400');
@@ -108,13 +138,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  // Auth
+  // Rate limiting
+  const clientIp = (req.headers['x-forwarded-for'] as string || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+  if (isRateLimited(clientIp)) {
+    res.setHeader('Retry-After', '60');
+    res.status(429).json({ error: 'Too many requests' });
+    return;
+  }
+
+  // Health check (requires auth)
+  if (!req.url || req.url === '/api/youtube' || req.url === '/api/youtube/' || req.url?.split('?')[0] === '/api/youtube' || req.url?.split('?')[0] === '/api/youtube/') {
+    const authToken = process.env.AUTH_TOKEN;
+    if (!authToken) { res.status(200).json({ status: 'ok' }); return; }
+    const auth = req.headers['authorization'];
+    if (!auth) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
+    if (!verifyToken(token, authToken)) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    res.status(200).json({ status: 'ok' });
+    return;
+  }
+
+  // Auth (constant-time comparison)
   const authToken = process.env.AUTH_TOKEN;
   if (authToken) {
     const auth = req.headers['authorization'];
     if (!auth) { res.status(401).json({ error: 'Missing Authorization header' }); return; }
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
-    if (token !== authToken) { res.status(401).json({ error: 'Invalid token' }); return; }
+    if (!verifyToken(token, authToken)) { res.status(401).json({ error: 'Invalid token' }); return; }
   } else {
     console.warn('[Auth] AUTH_TOKEN not set — proxy is open!');
   }
@@ -152,7 +202,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  // Build forwarding headers from the Innertube session
   const session = yt.session;
   const client = session?.context?.client;
   const apiKey = session?.api_key || (session as any)?.apiKey;
@@ -182,16 +231,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       bodyObj = { ...req.body };
     } else if (typeof req.body === 'string') {
       try { bodyObj = JSON.parse(req.body); } catch {
-        // Non-JSON body — forward as-is
         requestBody = req.body;
       }
     }
 
     if (bodyObj) {
-      // Merge proxy session context into the client's context, preserving
-      // client-specific fields (like clientName) that affect response format.
-      // This ensures youtubei.js on the MixChat side can parse the response
-      // with its own client type while the proxy's session provides auth.
       if (session?.context) {
         bodyObj.context = {
           ...(bodyObj.context || {}),
@@ -206,7 +250,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
-  // Append query string
   const finalURL = queryString ? `${targetURL}?${queryString}` : targetURL;
 
   if (DEBUG) {
@@ -222,7 +265,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (DEBUG) console.debug(`[Proxy] ← ${ytRes.status} ${ytRes.statusText}`);
 
-    // On 403, invalidate the Innertube session for retry
     if (ytRes.status === 403) {
       invalidateInnertube();
       console.error('[Proxy] YouTube returned 403 — invalidated session');
@@ -232,7 +274,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     res.setHeader('Content-Type', ytRes.headers.get('content-type') || 'application/json');
     res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Origin', isAllowedOrigin ? ALLOWED_ORIGIN : '');
     res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
     res.status(ytRes.status).send(respBody);
   } catch (error: any) {

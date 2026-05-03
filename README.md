@@ -14,7 +14,7 @@ This way MixChat's server IP never talks to YouTube directly -- only Vercel's IP
 
 **`POST /api/youtube/youtubei/v1/<endpoint>`** -- Proxies the request to YouTube
 
-All requests (except health check) require an `Authorization: Bearer <token>` header matching the `AUTH_TOKEN` env var.
+All requests (including health check) require an `Authorization: Bearer <token>` header matching the `AUTH_TOKEN` env var.
 
 Example:
 ```bash
@@ -37,7 +37,8 @@ The `context` in the body is merged with the proxy's session context (preserving
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `AUTH_TOKEN` | Yes | -- | Shared secret for Bearer auth. Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `AUTH_TOKEN` | Yes | -- | Shared secret for Bearer auth. Constant-time comparison prevents timing attacks. |
+| `CORS_ORIGIN` | No | -- | Allowed origin for CORS. Set to your MixChat URL. If empty, browser requests are blocked. |
 | `YT_CLIENT` | No | `WEB` | InnerTube client type. Must match MixChat's `YT_CLIENT` for compatible response formats. |
 | `YT_DEBUG` | No | `0` | Set to `1` for verbose logging |
 | `YT_USER_AGENT` | No | Chrome 124 | Custom User-Agent string |
@@ -66,3 +67,10 @@ vercel dev
 ## 403 handling
 
 When YouTube returns a 403, the proxy invalidates its Innertube session so the next request creates a fresh one. There is a 30 second cooldown after each 403 to avoid hammering YouTube.
+
+## Security
+
+- **Auth**: All requests require a Bearer token. Token comparison uses `crypto.timingSafeEqual` to prevent timing attacks.
+- **CORS**: `Access-Control-Allow-Origin` is set to `CORS_ORIGIN`. If not configured, CORS headers are empty and browser requests are blocked. Server-to-server requests (from MixChat) work regardless since they don't enforce CORS.
+- **Rate limiting**: 120 requests per minute per IP. Exceeded requests get a 429 with a `Retry-After` header.
+- **Health check**: Requires auth. Does not leak service info to unauthenticated requests.
