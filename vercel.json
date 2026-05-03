@@ -1,9 +1,8 @@
 {
   "outputDirectory": "public",
   "functions": {
-    "api/youtube/[...path].ts": {
-      "maxDuration": 300,
-      "memory": 1024
+    "api/[...path].ts": {
+      "maxDuration": 300
     }
   }
 }

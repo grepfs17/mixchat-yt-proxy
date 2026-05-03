@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { getInnertube, invalidateInnertube } from '../../lib/innertube';
+import { getInnertube, invalidateInnertube } from '../lib/innertube';
 
 const DEBUG = process.env.YT_DEBUG === '1';
 
@@ -40,9 +40,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
-  // The catch-all route captures everything after /api/youtube/
-  // e.g. /api/youtube/youtubei/v1/live_chat/get_live_chat
-  const pathSegments = (req.url || '').replace(/^\/api\/youtube\/?/, '').replace(/\?.*$/, '');
+  // The catch-all route captures everything after /api/
+  // e.g. /api/youtube/youtubei/v1/player → /youtube/youtubei/v1/player
+  // We only handle paths starting with /youtube/
+  const fullPath = (req.url || '').replace(/\?.*$/, '');
+  if (!fullPath.startsWith('/api/youtube/')) {
+    res.status(404).json({ error: 'Not found. Use /api/youtube/youtubei/v1/...' });
+    return;
+  }
+
+  const pathSegments = fullPath.replace(/^\/api\/youtube\/?/, '');
   const innerTubePath = '/' + pathSegments;
 
   if (!pathSegments) {
@@ -77,14 +84,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         try {
           body = JSON.parse(req.body);
         } catch {
-          // Non-JSON body — fall back to raw forwarding
           return await forwardRaw(yt, innerTubePath, req, res, req.body, corsHeaders);
         }
       }
     }
 
-    // Strip "youtubei/v1/" prefix since actions.execute expects just
-    // the API name (e.g. "live_chat/get_live_chat" or "player").
     let apiName = innerTubePath.replace(/^\//, '');
     if (apiName.startsWith('youtubei/v1/')) {
       apiName = apiName.slice('youtubei/v1/'.length);
@@ -104,7 +108,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    // Use actions.execute for JSON payloads
     let response;
     try {
       response = await yt.actions.execute(apiName, {
@@ -119,7 +122,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         invalidateInnertube();
         console.error('[Proxy] InnerTube 403 — invalidated session for retry');
 
-        // Retry once with a fresh session
         try {
           yt = await getInnertube();
           response = await yt.actions.execute(apiName, {
@@ -137,7 +139,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    // response from actions.execute({ parse: false }) is raw JSON
     const responseData = typeof response === 'string' ? response : JSON.stringify(response);
 
     res.setHeader('Content-Type', 'application/json');
@@ -154,10 +155,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 }
 
-/**
- * For non-JSON request bodies (protobuf, etc.), forward the raw request
- * directly to YouTube using the Innertube session's context.
- */
 async function forwardRaw(
   yt: any,
   innerTubePath: string,
@@ -176,7 +173,6 @@ async function forwardRaw(
     'Accept-Language': 'en-US,en;q=0.9',
   };
 
-  // Copy the InnerTube context headers from the session
   const session = yt.session;
   if (session?.context?.client) {
     const client = session.context.client;
