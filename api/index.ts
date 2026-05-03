@@ -8,7 +8,6 @@ export const config = {
 };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // CORS preflight
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -23,7 +22,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     'Access-Control-Allow-Headers': 'Authorization, Content-Type',
   };
 
-  // Validate auth token from Authorization header
   const authToken = process.env.AUTH_TOKEN;
   if (!authToken) {
     console.error('[Auth] AUTH_TOKEN env var is not set — proxy is open!');
@@ -40,22 +38,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
-  // The catch-all route captures everything after /api/
-  // e.g. /api/youtube/youtubei/v1/player → /youtube/youtubei/v1/player
-  // We only handle paths starting with /youtube/
-  const fullPath = (req.url || '').replace(/\?.*$/, '');
-  if (!fullPath.startsWith('/api/youtube/')) {
-    res.status(404).json({ error: 'Not found. Use /api/youtube/youtubei/v1/...' });
+  // The rewrite preserves the original URL in req.url
+  // e.g. /api/youtube/youtubei/v1/player → strip /api/youtube/ → youtubei/v1/player
+  const originalUrl: string = req.url || '';
+  const pathMatch = originalUrl.match(/^\/api\/youtube\/(.+)/);
+  if (!pathMatch) {
+    res.status(400).json({ error: 'Invalid path. Expected /api/youtube/youtubei/v1/...' });
     return;
   }
 
-  const pathSegments = fullPath.replace(/^\/api\/youtube\/?/, '');
+  const pathAndQuery = pathMatch[1];
+  const [pathSegments, queryString] = pathAndQuery.split('?');
   const innerTubePath = '/' + pathSegments;
-
-  if (!pathSegments) {
-    res.status(400).json({ error: 'Missing InnerTube path' });
-    return;
-  }
 
   try {
     let yt;
@@ -75,7 +69,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    // Parse request body
     let body: any = undefined;
     if (req.method === 'POST' && req.body) {
       if (typeof req.body === 'object') {
@@ -98,9 +91,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.debug(`[Proxy] ${req.method} → InnerTube API: ${apiName}`, { hasBody: !!body });
     }
 
-    // Merge query params from the original request URL
     const params: Record<string, any> = {};
-    const queryString = (req.url || '').split('?')[1];
     if (queryString) {
       for (const pair of queryString.split('&')) {
         const [key, value] = pair.split('=');
@@ -163,8 +154,7 @@ async function forwardRaw(
   rawBody: string,
   corsHeaders: Record<string, string>,
 ): Promise<void> {
-  const baseURL = 'https://www.youtube.com';
-  const targetURL = `${baseURL}${innerTubePath}`;
+  const targetURL = `https://www.youtube.com${innerTubePath}`;
 
   const headers: Record<string, string> = {
     'Content-Type': req.headers['content-type'] || 'application/x-protobuf',
@@ -187,12 +177,7 @@ async function forwardRaw(
     headers['x-youtube-api-key'] = yt.session.api_key;
   }
 
-  const ytRes = await fetch(targetURL, {
-    method: 'POST',
-    headers,
-    body: rawBody,
-  });
-
+  const ytRes = await fetch(targetURL, { method: 'POST', headers, body: rawBody });
   const respBody = await ytRes.text();
 
   res.setHeader('Content-Type', ytRes.headers.get('content-type') || 'application/json');
