@@ -278,6 +278,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const pathSegments = qIdx >= 0 ? pathAndQuery.slice(0, qIdx) : pathAndQuery;
   const queryString = qIdx >= 0 ? pathAndQuery.slice(qIdx + 1) : '';
 
+  // Reject full URLs or garbage paths — only InnerTube API paths are valid
+  if (pathSegments.startsWith('http') || pathSegments.includes('://') || pathSegments.includes('@')) {
+    res.status(400).json({ error: 'Invalid InnerTube path. Expected youtubei/v1/<endpoint>', received: pathSegments });
+    return;
+  }
+
   try {
     let yt;
     try {
