@@ -1,4 +1,5 @@
 {
+  "outputDirectory": "public",
   "functions": {
     "api/youtube/[...path].ts": {
       "maxDuration": 300,
