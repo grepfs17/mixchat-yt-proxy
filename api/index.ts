@@ -188,9 +188,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     if (bodyObj) {
-      // Replace client context with the proxy's session context
+      // Merge proxy session context into the client's context, preserving
+      // client-specific fields (like clientName) that affect response format.
+      // This ensures youtubei.js on the MixChat side can parse the response
+      // with its own client type while the proxy's session provides auth.
       if (session?.context) {
-        bodyObj.context = session.context;
+        bodyObj.context = {
+          ...(bodyObj.context || {}),
+          ...session.context,
+          client: {
+            ...(bodyObj.context?.client || {}),
+            ...session.context.client,
+          },
+        };
       }
       requestBody = JSON.stringify(bodyObj);
     }
