@@ -218,8 +218,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   };
 
   if (apiKey) forwardHeaders['x-youtube-api-key'] = apiKey;
-  if (client?.clientName) forwardHeaders['x-youtube-client-name'] = String(client.clientName);
-  if (client?.clientVersion) forwardHeaders['x-youtube-client-version'] = client.clientVersion;
+  // Only add visitorData header — don't overwrite client type headers
+  // so the response format matches what MixChat's youtubei.js expects
   if (visitorData) forwardHeaders['x-goog-visitor-id'] = visitorData;
   if (process.env.YT_COOKIE) forwardHeaders['Cookie'] = process.env.YT_COOKIE;
 
@@ -235,14 +235,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    if (bodyObj) {
+if (bodyObj) {
+      // Merge proxy session fields into the client's context, but preserve
+      // the client's own client type/version so YouTube returns responses
+      // in the format MixChat expects. Only inject auth-related fields
+      // from the proxy session: visitorData, request, user, and capabilities.
       if (session?.context) {
+        const proxyCtx = session.context;
+        const clientCtx = bodyObj.context || {};
+
         bodyObj.context = {
-          ...(bodyObj.context || {}),
-          ...session.context,
+          ...clientCtx,
+          request: proxyCtx.request || clientCtx.request,
+          user: proxyCtx.user || clientCtx.user,
           client: {
-            ...(bodyObj.context?.client || {}),
-            ...session.context.client,
+            ...clientCtx.client,
+            ...(proxyCtx.client?.visitorData ? { visitorData: proxyCtx.client.visitorData } : {}),
           },
         };
       }
