@@ -4,6 +4,7 @@ import { timingSafeEqual } from 'crypto';
 
 const DEBUG = process.env.YT_DEBUG === '1';
 const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || '';
+const YT_USER_AGENT = process.env.YT_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 // ── Rate limiting (in-memory, per-IP) ──────────────────────────────
 const RATE_LIMIT_WINDOW_MS = 60_000;
@@ -21,13 +22,15 @@ function isRateLimited(ip: string): boolean {
   return entry.count > RATE_LIMIT_MAX_REQUESTS;
 }
 
-// Clean up expired entries every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, entry] of ipRequests) {
-    if (now > entry.resetAt) ipRequests.delete(ip);
-  }
-}, 300_000);
+// Clean up expired entries every 5 minutes (skip on Vercel serverless)
+if (!process.env.VERCEL) {
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ip, entry] of ipRequests) {
+      if (now > entry.resetAt) ipRequests.delete(ip);
+    }
+  }, 300_000);
+}
 
 // ── Constant-time auth ──────────────────────────────────────────────
 function verifyToken(provided: string, expected: string): boolean {
@@ -70,7 +73,7 @@ async function getInnertube(): Promise<Innertube> {
     if (process.env.YT_USER_AGENT) {
       opts.user_agent = process.env.YT_USER_AGENT;
     } else if (clientType === 'WEB') {
-      opts.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+      opts.user_agent = YT_USER_AGENT;
     }
 
     opts.generate_session_locally = process.env.YT_GENERATE_SESSION_LOCALLY !== 'false';
@@ -91,18 +94,54 @@ async function getInnertube(): Promise<Innertube> {
         if (!visitorData) throw new Error('No visitorData');
         const dom = new JSDOM('<!DOCTYPE html><html><head></head><body></body></html>', { url: 'https://www.youtube.com/', referrer: 'https://www.youtube.com/' });
         const win = dom.window as any;
-        Object.assign(globalThis, { window: win, document: win.document, location: win.location, origin: win.origin });
+
+        const globalsToSet: Record<string, any> = { window: win, document: win.document, location: win.location, origin: win.origin };
+        const saved: Record<string, any> = {};
+        const existingKeys = Object.keys(globalsToSet);
+        for (const key of existingKeys) {
+          if (key in globalThis) saved[key] = (globalThis as any)[key];
+        }
+        let navigatorSaved = false;
+        let navigatorHadDescriptor = false;
+        let existingNavigatorDescriptor: PropertyDescriptor | undefined;
+        if ('navigator' in globalThis) {
+          navigatorSaved = true;
+          existingNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+          navigatorHadDescriptor = !!existingNavigatorDescriptor;
+        }
+
+        Object.assign(globalThis, globalsToSet);
         if (!Reflect.has(globalThis, 'navigator')) Object.defineProperty(globalThis, 'navigator', { value: win.navigator });
-        const bgConfig = { fetch: (input: any, init?: any) => fetch(input, init), globalObj: globalThis, identifier: visitorData, requestKey: 'O43z0dpjhgX20SCx4KAo' };
-        const bgChallenge = await BG.Challenge.create(bgConfig as any);
-        if (!bgChallenge) throw new Error('No BotGuard challenge');
-        const interpJs = bgChallenge.interpreterJavascript?.privateDoNotAccessOrElseSafeScriptWrappedValue;
-        if (interpJs) new Function(interpJs)(); else throw new Error('No interpreter script');
-        const poResult = await BG.PoToken.generate({ program: bgChallenge.program, globalName: bgChallenge.globalName, bgConfig: bgConfig as any });
-        if (!poResult.poToken) throw new Error('Empty poToken');
-        opts.po_token = poResult.poToken;
-        opts.visitor_data = visitorData;
-        if (DEBUG) console.debug('[YouTube] PoToken generated');
+
+        try {
+          const bgConfig = { fetch: (input: any, init?: any) => fetch(input, init), globalObj: globalThis, identifier: visitorData, requestKey: 'O43z0dpjhgX20SCx4KAo' };
+          const bgChallenge = await BG.Challenge.create(bgConfig as any);
+          if (!bgChallenge) throw new Error('No BotGuard challenge');
+          const interpJs = bgChallenge.interpreterJavascript?.privateDoNotAccessOrElseSafeScriptWrappedValue;
+          if (interpJs) new Function(interpJs)(); else throw new Error('No interpreter script');
+          const poResult = await BG.PoToken.generate({ program: bgChallenge.program, globalName: bgChallenge.globalName, bgConfig: bgConfig as any });
+          if (!poResult.poToken) throw new Error('Empty poToken');
+          opts.po_token = poResult.poToken;
+          opts.visitor_data = visitorData;
+          if (DEBUG) console.debug('[YouTube] PoToken generated');
+        } finally {
+          for (const key of existingKeys) {
+            if (key in saved) {
+              (globalThis as any)[key] = saved[key];
+            } else {
+              delete (globalThis as any)[key];
+            }
+          }
+          if (navigatorSaved) {
+            if (navigatorHadDescriptor && existingNavigatorDescriptor) {
+              Object.defineProperty(globalThis, 'navigator', existingNavigatorDescriptor);
+            } else if (!navigatorHadDescriptor) {
+              delete (globalThis as any)['navigator'];
+            }
+          } else {
+            delete (globalThis as any)['navigator'];
+          }
+        }
       } catch (poErr: any) {
         console.warn('[YouTube] PoToken failed:', poErr?.message || String(poErr));
       }
@@ -130,7 +169,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   // CORS preflight
   if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', isAllowedOrigin ? ALLOWED_ORIGIN : '');
+    if (isAllowedOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
     res.setHeader('Access-Control-Max-Age', '86400');
@@ -211,7 +252,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const forwardHeaders: Record<string, string> = {
     'Content-Type': req.headers['content-type'] as string || 'application/json',
-    'User-Agent': process.env.YT_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'User-Agent': YT_USER_AGENT,
     'Referer': 'https://www.youtube.com/',
     'Accept-Language': 'en-US,en;q=0.9',
     'Origin': 'https://www.youtube.com',
@@ -235,7 +276,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-if (bodyObj) {
+    if (bodyObj) {
       // Merge proxy session fields into the client's context, but preserve
       // the client's own client type/version so YouTube returns responses
       // in the format MixChat expects. Only inject auth-related fields
@@ -282,7 +323,9 @@ if (bodyObj) {
 
     res.setHeader('Content-Type', ytRes.headers.get('content-type') || 'application/json');
     res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Access-Control-Allow-Origin', isAllowedOrigin ? ALLOWED_ORIGIN : '');
+    if (isAllowedOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+    }
     res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
     res.status(ytRes.status).send(respBody);
   } catch (error: any) {
