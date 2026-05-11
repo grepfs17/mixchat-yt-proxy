@@ -7,7 +7,7 @@ const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || '';
 
 // ── Rate limiting (in-memory, per-IP) ──────────────────────────────
 const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX_REQUESTS = 120;
+const RATE_LIMIT_MAX_REQUESTS = parseInt(process.env.RATE_LIMIT_MAX || "200", 10);
 const ipRequests = new Map<string, { count: number; resetAt: number }>();
 
 function isRateLimited(ip: string): boolean {
