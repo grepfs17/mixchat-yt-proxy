@@ -261,8 +261,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (apiKey) forwardHeaders['x-youtube-api-key'] = apiKey;
   // Only add visitorData header — don't overwrite client type headers
   // so the response format matches what MixChat's youtubei.js expects
-  if (visitorData) forwardHeaders['x-goog-visitor-id'] = visitorData;
-  if (process.env.YT_COOKIE) forwardHeaders['Cookie'] = process.env.YT_COOKIE;
+  const userAuthorization = req.headers['x-youtube-user-authorization'];
+  if (typeof userAuthorization === 'string' && userAuthorization) {
+    forwardHeaders['Authorization'] = userAuthorization;
+  } else if (process.env.YT_COOKIE) {
+    forwardHeaders['Cookie'] = process.env.YT_COOKIE;
+  }
 
   // Inject session context into request body for POST requests
   let requestBody: string | undefined;
