@@ -173,7 +173,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-YouTube-User-Authorization');
     res.setHeader('Access-Control-Max-Age', '86400');
     res.status(204).end();
     return;
@@ -330,7 +330,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (isAllowedOrigin) {
       res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
     }
-    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-YouTube-User-Authorization');
     res.status(ytRes.status).send(respBody);
   } catch (error: any) {
     const msg = error?.message || String(error);
