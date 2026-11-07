@@ -1,12 +1,12 @@
-# MixChat YouTube Proxy
+# Mixchat YouTube Proxy
 
-A Vercel serverless function that proxies YouTube InnerTube API requests. MixChat uses this to route all YouTube API traffic through a separate domain, avoiding IP blocks from YouTube on the main app server.
+A Vercel serverless function that proxies YouTube InnerTube API requests. Mixchat uses this to route all YouTube API traffic through a separate domain, avoiding IP blocks from YouTube on the main app server.
 
 ## How it works
 
-MixChat sends InnerTube API requests here. The proxy adds its own session context (API key, visitor data, client headers) and forwards the request to YouTube. The raw response is sent back unchanged.
+Mixchat sends InnerTube API requests here. The proxy adds its own session context (API key, visitor data, client headers) and forwards the request to YouTube. The raw response is sent back unchanged.
 
-This way MixChat's server IP never talks to YouTube directly -- only Vercel's IPs do.
+This way Mixchat's server IP never talks to YouTube directly -- only Vercel's IPs do.
 
 ## Endpoints
 
@@ -31,15 +31,15 @@ The `context` in the body is merged with the proxy's session context (preserving
 
 1. Deploy to Vercel: `vercel deploy --prod`
 2. Set environment variables in Vercel dashboard (or `.env` for local dev)
-3. In MixChat, set `YT_PROXY` to your deployed URL and `YT_PROXY_TOKEN` to the auth token
+3. In Mixchat, set `YT_PROXY` to your deployed URL and `YT_PROXY_TOKEN` to the auth token
 
 ## Environment variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `AUTH_TOKEN` | Yes | -- | Shared secret for Bearer auth. Constant-time comparison prevents timing attacks. |
-| `CORS_ORIGIN` | No | -- | Allowed origin for CORS. Set to your MixChat URL. If empty, browser requests are blocked. |
-| `YT_CLIENT` | No | `WEB` | InnerTube client type. Must match MixChat's `YT_CLIENT` for compatible response formats. |
+| `CORS_ORIGIN` | No | -- | Allowed origin for CORS. Set to your Mixchat URL. If empty, browser requests are blocked. |
+| `YT_CLIENT` | No | `WEB` | InnerTube client type. Must match Mixchat's `YT_CLIENT` for compatible response formats. |
 | `YT_DEBUG` | No | `0` | Set to `1` for verbose logging |
 | `YT_USER_AGENT` | No | Chrome 124 | Custom User-Agent string |
 | `YT_COOKIE` | No | -- | Browser cookie string for authenticated access |
@@ -71,6 +71,6 @@ When YouTube returns a 403, the proxy invalidates its Innertube session so the n
 ## Security
 
 - **Auth**: All requests require a Bearer token. Token comparison uses `crypto.timingSafeEqual` to prevent timing attacks.
-- **CORS**: `Access-Control-Allow-Origin` is set to `CORS_ORIGIN`. If not configured, CORS headers are empty and browser requests are blocked. Server-to-server requests (from MixChat) work regardless since they don't enforce CORS.
+- **CORS**: `Access-Control-Allow-Origin` is set to `CORS_ORIGIN`. If not configured, CORS headers are empty and browser requests are blocked. Server-to-server requests (from Mixchat) work regardless since they don't enforce CORS.
 - **Rate limiting**: 120 requests per minute per IP. Exceeded requests get a 429 with a `Retry-After` header.
 - **Health check**: Requires auth. Does not leak service info to unauthenticated requests.
